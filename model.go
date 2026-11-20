@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.3.0"
 
 const (
 	pageDevices = iota
@@ -53,14 +53,17 @@ type app struct {
 	copied   string
 	copiedAt time.Time
 
-	post    func(func())
-	spawn   func(func())
-	changed func(config)
-	quit    func()
-	close   func()
-	clock   func() time.Time
-	copy    func(string)
-	alert   func(string)
+	post     func(func())
+	spawn    func(func())
+	changed  func(config)
+	setLogin func(bool) error
+	login    bool
+	loginErr string
+	quit     func()
+	close    func()
+	clock    func() time.Time
+	copy     func(string)
+	alert    func(string)
 }
 
 var typeOrder = []string{

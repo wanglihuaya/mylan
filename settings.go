@@ -2,7 +2,9 @@ package main
 
 import (
 	"runtime"
+	"strings"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/plugins/updater"
 	"github.com/egoist/mygo/ui"
 )
@@ -13,6 +15,16 @@ func (a *app) settings(c *ui.Context, k ink) {
 	})
 	ui.Scroll(c.Key("settings")).Grow(1).Padding(8, gutter, gutter, gutter).Gap(22).Children(func() {
 		ui.Text(c, "设置").FontSize(17).FontWeight(650)
+
+		section(c, k, "通用", func() {
+			on := a.login
+			switchRow(c.Key("login"), k, "开机自启", "登录后自动打开 mylan。", &on, func() {
+				a.setOpenAtLogin(on)
+			})
+			if a.loginErr != "" {
+				ui.Text(c, a.loginErr).FontSize(11).TextColor(k.muted).LineHeight(1.4)
+			}
+		})
 
 		if runtime.GOOS != "windows" {
 			section(c, k, "菜单栏", func() {
@@ -85,6 +97,34 @@ func (a *app) settings(c *ui.Context, k ink) {
 			}
 		})
 	})
+}
+
+func (a *app) setOpenAtLogin(on bool) {
+	set := a.setLogin
+	if set == nil {
+		set = mygo.App.SetOpenAtLogin
+	}
+	if err := set(on); err != nil {
+		a.loginErr = loginError(err)
+		if a.post != nil {
+			a.post(func() {})
+		}
+		return
+	}
+	a.login = on
+	a.loginErr = ""
+}
+
+func loginError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "Login Items"):
+		return "请到「系统设置 → 通用 → 登录项」里允许 mylan。"
+	case strings.Contains(msg, "app bundle"):
+		return "开发版不能设置开机自启，请安装发布的应用。"
+	default:
+		return "无法设置开机自启。"
+	}
 }
 
 func section(c *ui.Context, k ink, title string, build func()) {

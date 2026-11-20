@@ -31,6 +31,7 @@ func (s *shell) ready() {
 		cfg:     cfg,
 		dataDir: dir,
 		clock:   time.Now,
+		login:   mygo.App.OpenAtLogin(),
 	}
 	s.a = a
 	a.post = func(fn func()) {

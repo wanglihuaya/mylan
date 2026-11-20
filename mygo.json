@@ -1,7 +1,7 @@
 {
   "name": "mylan",
   "identifier": "app.mylan",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "out": "build",
   "updates": {
     "publicKey": "rDq9aylOc+BfB7Y8/apM1UzPbCCef/N5LQqCg15hvh8=",

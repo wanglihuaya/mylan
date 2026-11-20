@@ -84,7 +84,7 @@ func TestPanelInteractions(t *testing.T) {
 	if err := view.Click("设置"); err != nil {
 		t.Fatal(err)
 	}
-	if a.page != pageSettings || !view.HasText("快速") {
+	if a.page != pageSettings || !view.HasText("快速") || !view.HasText("开机自启") {
 		t.Fatalf("settings: %v", view.Texts())
 	}
 }
@@ -104,6 +104,32 @@ func TestDetailNoteAndWatch(t *testing.T) {
 	if !a.watching("192.168.10.3") {
 		t.Fatal("switch did not start watching")
 	}
+}
+
+func TestOpenAtLoginSetting(t *testing.T) {
+	a := sampleApp()
+	var got bool
+	a.setLogin = func(on bool) error {
+		got = on
+		return nil
+	}
+	a.setOpenAtLogin(true)
+	if !a.login || !got || a.loginErr != "" {
+		t.Fatalf("login %v err %q", a.login, a.loginErr)
+	}
+	a.setLogin = func(bool) error { return errLogin }
+	a.setOpenAtLogin(false)
+	if !a.login || a.loginErr == "" {
+		t.Fatalf("failed change applied: login %v err %q", a.login, a.loginErr)
+	}
+}
+
+var errLogin = loginFailure{}
+
+type loginFailure struct{}
+
+func (loginFailure) Error() string {
+	return "mygo: allow mylan to open at login in System Settings > General > Login Items"
 }
 
 func hasExact(view *ui.Tester, s string) bool {
