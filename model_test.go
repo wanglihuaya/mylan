@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -135,6 +136,24 @@ func TestApplyDropsStale(t *testing.T) {
 	}
 }
 
+func TestLiveScan(t *testing.T) {
+	if os.Getenv("MYLAN_LIVE") == "" {
+		t.Skip()
+	}
+	rep, err := runScan(t.TempDir(), config{Names: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Scanned.Subnet == "" || len(rep.Devices) == 0 {
+		t.Fatalf("empty scan: %+v devices %d", rep.Scanned, len(rep.Devices))
+	}
+	b, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s", b)
+}
+
 func TestLiveFastScan(t *testing.T) {
 	if os.Getenv("MYLAN_LIVE") == "" {
 		t.Skip()
@@ -146,18 +165,21 @@ func TestLiveFastScan(t *testing.T) {
 	if rep.Scanned.Subnet == "" || len(rep.Devices) == 0 {
 		t.Fatalf("empty scan: %+v devices %d", rep.Scanned, len(rep.Devices))
 	}
-	t.Logf("%s %d devices, %d warnings", rep.Scanned.Subnet, len(rep.Devices), len(rep.Warnings))
+	b, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s", b)
 }
 
 func TestScanUnavailable(t *testing.T) {
 	if err := scanUnavailable("darwin"); err != nil {
 		t.Fatal(err)
 	}
-	err := scanUnavailable("windows")
-	if err == nil || !strings.Contains(err.Error(), "Windows") || strings.Contains(err.Error(), "本地网络") {
+	if err := scanUnavailable("windows"); err != nil {
 		t.Fatal(err)
 	}
-	err = scanUnavailable("linux")
+	err := scanUnavailable("linux")
 	if err == nil || !strings.Contains(err.Error(), "Linux") {
 		t.Fatal(err)
 	}

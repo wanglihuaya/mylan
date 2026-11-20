@@ -98,10 +98,8 @@ func ensureScript(dir string) (string, error) {
 // panel would add the macOS local-network instructions.
 func scanUnavailable(goos string) error {
 	switch goos {
-	case "darwin":
+	case "darwin", "windows":
 		return nil
-	case "windows":
-		return fmt.Errorf("当前版本的扫描只支持 macOS，Windows 上还不能发现局域网设备")
 	case "linux":
 		return fmt.Errorf("当前版本的扫描只支持 macOS，Linux 上还不能发现局域网设备")
 	default:
@@ -116,9 +114,14 @@ func pythonBin() string {
 	return "/usr/bin/python3"
 }
 
-// runScan executes the embedded lanmac and parses its JSON.
-// A full scan pings the subnet, so it is capped at two minutes.
+// runScan executes the embedded lanmac on macOS, and the native scanner
+// on Windows. A full scan pings the subnet, so it is capped at two minutes.
 func runScan(dir string, cfg config) (report, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if rep, ok, err := scanNative(ctx, cfg); ok {
+		return rep, err
+	}
 	script, err := ensureScript(dir)
 	if err != nil {
 		return report{}, fmt.Errorf("无法准备扫描脚本: %w", err)
@@ -126,8 +129,6 @@ func runScan(dir string, cfg config) (report, error) {
 	if err := scanUnavailable(runtime.GOOS); err != nil {
 		return report{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, pythonBin(), append([]string{script}, scanArgs(cfg)...)...)
 	stopScan(cmd)
 	cmd.WaitDelay = 2 * time.Second

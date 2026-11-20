@@ -1,6 +1,8 @@
 package main
 
 import (
+	"runtime"
+
 	"github.com/egoist/mygo/plugins/updater"
 	"github.com/egoist/mygo/ui"
 )
@@ -12,13 +14,15 @@ func (a *app) settings(c *ui.Context, k ink) {
 	ui.Scroll(c.Key("settings")).Grow(1).Padding(8, gutter, gutter, gutter).Gap(22).Children(func() {
 		ui.Text(c, "设置").FontSize(17).FontWeight(650)
 
-		section(c, k, "菜单栏", func() {
-			show := !a.cfg.HideMenuCount
-			switchRow(c.Key("menu-count"), k, "显示数量", "在图标后面显示在线设备数。", &show, func() {
-				a.cfg.HideMenuCount = !show
-				a.persist()
+		if runtime.GOOS != "windows" {
+			section(c, k, "菜单栏", func() {
+				show := !a.cfg.HideMenuCount
+				switchRow(c.Key("menu-count"), k, "显示数量", "在图标后面显示在线设备数。", &show, func() {
+					a.cfg.HideMenuCount = !show
+					a.persist()
+				})
 			})
-		})
+		}
 
 		section(c, k, "扫描", func() {
 			mode := 0

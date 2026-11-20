@@ -131,7 +131,7 @@ func (s *shell) updateTray() {
 	}
 	n := s.a.onlineCount()
 	title := ""
-	if !s.a.cfg.HideMenuCount && n > 0 {
+	if runtime.GOOS != "windows" && !s.a.cfg.HideMenuCount && n > 0 {
 		title = fmt.Sprint(n)
 	}
 	tip := "mylan"
