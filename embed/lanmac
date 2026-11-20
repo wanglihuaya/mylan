@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""lanmac — 局域网设备发现 / IP 查询 CLI（macOS，零第三方依赖）
+
+默认枚举网段内所有设备（不只是 Apple 设备）：设备名、类型、厂商、IP、MAC、
+开放端口与状态。类型来自 Bonjour 服务、AirPlay 机型、MAC 厂商库、开放端口
+和主机名启发式；厂商来自系统里的 nmap OUI 库（缺失时用内置常见前缀表）。
+
+原理
+----
+1. `route -n get default` + `ifconfig`        → 当前生效网卡/网段/网关
+2. 并行 ping 扫描 + `arp -an`                 → 存活主机与 MAC
+3. `dns-sd -B / -L`（Bonjour/mDNS）           → 设备名、机型、主机名、服务
+4. `getaddrinfo`（或 `dns-sd -G`）            → 主机名解析为 IP
+5. MAC OUI 厂商库 + 端口探测 + 名称启发式     → 设备类型判定
+
+用法
+----
+    lanmac                       # 扫描当前网段的所有设备（默认）
+    lanmac -m                    # 只看 Mac 电脑
+    lanmac --type printer,phone  # 只看指定类型
+    lanmac -j                    # JSON 输出，便于脚本处理
+    lanmac --fast                # 快速模式：只读 ARP 缓存（约 3 秒）
+    lanmac 192.168.10.172        # 只看指定 IP / 名称关键字
+    lanmac -s 192.168.1.0/24     # 手动指定网段
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION = "1.1.0"
+
+# 浏览哪些 Bonjour 服务类型（服务类型, 展示名）
+SERVICES = [
+    ("_airplay._tcp", "AirPlay"),
+    ("_companion-link._tcp", "接力"),
+    ("_ssh._tcp", "SSH"),
+    ("_smb._tcp", "文件共享"),
+    ("_rfb._tcp", "屏幕共享"),
+    ("_ipp._tcp", "打印"),
+    ("_printer._tcp", "打印"),
+    ("_googlecast._tcp", "投屏"),
+    ("_hap._tcp", "HomeKit"),
+]
+SERVICE_LABELS = dict(SERVICES)
+# 同名设备的命名优先级（AirPlay 的实例名最规范，打印共享名最不可靠）
+NAME_PRIORITY = {
+    "_airplay._tcp": 100,
+    "_companion-link._tcp": 90,
+    "_googlecast._tcp": 70,
+    "_ssh._tcp": 60,
+    "_smb._tcp": 55,
+    "_rfb._tcp": 50,
+    "_hap._tcp": 40,
+    "_ipp._tcp": 20,
+    "_printer._tcp": 20,
+}
+SERVICE_ORDER = [label for _, label in SERVICES]
+
+# 默认端口探测集合（用于设备类型判定，可用 -p 覆盖、--no-probe 关闭）
+DEFAULT_PORTS = [22, 80, 443, 445, 631, 3389, 5000, 5001, 5900, 7000, 9100, 62078]
+
+# 设备类型：key → 中文标签
+TYPE_LABELS = {
+    "mac": "Mac",
+    "apple": "Apple 设备",
+    "pc": "Windows PC",
+    "linux": "Linux",
+    "phone": "手机",
+    "tablet": "平板",
+    "tv": "电视/投屏",
+    "speaker": "音箱",
+    "printer": "打印机",
+    "router": "路由器",
+    "nas": "NAS",
+    "camera": "摄像头",
+    "iot": "智能设备",
+    "unknown": "未知",
+}
+TYPE_ORDER = list(TYPE_LABELS)
+TYPE_BY_LABEL = {v: k for k, v in TYPE_LABELS.items()}
+
+# 机型标识 → 可读名称（只收录常见/确定的型号，未收录的显示原始标识）
+MODEL_NAMES = {
+    "MacBookPro15,1": 'MacBook Pro 15" (2018/19)',
+    "MacBookPro15,2": 'MacBook Pro 13" (2018/19)',
+    "MacBookPro15,3": 'MacBook Pro 15" (2018)',
+    "MacBookPro15,4": 'MacBook Pro 13" (2019)',
+    "MacBookPro16,1": 'MacBook Pro 16" (2019)',
+    "MacBookPro16,2": 'MacBook Pro 13" (2020)',
+    "MacBookPro16,3": 'MacBook Pro 13" (2020)',
+    "MacBookPro16,4": 'MacBook Pro 16" (2019)',
+    "MacBookPro17,1": 'MacBook Pro 13" M1 (2020)',
+    "MacBookPro18,1": 'MacBook Pro 16" M1 Pro/Max (2021)',
+    "MacBookPro18,2": 'MacBook Pro 16" M1 Max (2021)',
+    "MacBookPro18,3": 'MacBook Pro 14" M1 Pro/Max (2021)',
+    "MacBookPro18,4": 'MacBook Pro 14" M1 Max (2021)',
+    "Mac14,5": 'MacBook Pro 14" (2023)',
+    "Mac14,6": 'MacBook Pro 16" (2023)',
+    "Mac14,7": 'MacBook Pro 13" M2 (2022)',
+    "Mac14,2": 'MacBook Air 13" M2 (2022)',
+    "Mac14,15": 'MacBook Air 15" (2023)',
+    "Mac14,3": "Mac mini (2023)",
+    "Mac14,12": "Mac mini M2 Pro (2023)",
+    "Mac16,8": 'MacBook Pro 14" M4 Pro (2024)',
+    "Mac16,10": "Mac mini (2024)",
+    "Mac16,11": "Mac mini (2024)",
+    "Mac17,8": "MacBook Pro (2025)",
+    "AppleTV3,2": "Apple TV HD",
+    "AppleTV6,2": "Apple TV 4K",
+    "AudioAccessory5,1": "HomePod mini",
+    "AudioAccessory6,1": "HomePod (2nd gen)",
+}
+
+# 厂商关键字 → 类型（在端口/名称都判断不出来时兜底）
+VENDOR_TYPE_HINTS = [
+    (("synology", "qnap", "buffalo", "drobo", "western digital"), "nas"),
+    (("hikvision", "dahua", "uniview", "reolink", "ezviz", "axis communications"), "camera"),
+    (("seiko epson", "brother industries", "ricoh", "sharp corporation", "kyocera",
+      "xerox", "lexmark", "canon inc"), "printer"),
+    (("quectel", "fibocom", "neoway"), "iot"),
+    (("sonos", "bose", "harman", "denon", "yamaha"), "speaker"),
+    (("espressif", "tuya", "broadlink", "shelly", "signify", "philips lighting"), "iot"),
+    (("tp-link", "tplink", "d-link", "tenda", "ubiquiti", "aruba networks", "meraki",
+      "mikrotik", "ruijie", "h3c", "linksys", "netgear", "ruckus", "zyxel"), "router"),
+    (("raspberry pi",), "linux"),
+    (("google,", "roku", "vizio", "sony", "tcl", "hisense", "skyworth"), "tv"),
+    (("xiaomi", "oppo", "vivo", "oneplus", "motorola", "nokia", "honor", "realme",
+      "meizu", "samsung electronics"), "phone"),
+    (("dell", "lenovo", "acer", "asustek", "micro-star", "gigabyte", "asrock",
+      "intel corporate", "foxconn", "pegatron", "compal"), "pc"),
+]
+
+# 内置常见 OUI 前缀（找不到 nmap 的 nmap-mac-prefixes 时使用）
+FALLBACK_OUI = {
+    "001B63": "Apple, Inc.",
+    "3C0754": "Apple, Inc.",
+    "F4289D": "Apple, Inc.",
+    "A45E60": "Apple, Inc.",
+    "B827EB": "Raspberry Pi Foundation",
+    "240AC4": "Espressif Inc.",
+    "50C7BF": "TP-LINK TECHNOLOGIES",
+    "000E58": "Sonos, Inc.",
+    "001A11": "Google, Inc.",
+    "F4F5D8": "Google, Inc.",
+}
+
+# 系统里可能存在的完整 OUI 库
+OUI_PATHS = [
+    "/opt/homebrew/share/nmap/nmap-mac-prefixes",
+    "/usr/local/share/nmap/nmap-mac-prefixes",
+    "/usr/share/nmap/nmap-mac-prefixes",
+    "/opt/local/share/nmap/nmap-mac-prefixes",
+]
+
+# 表格可选列
+COLUMN_LABELS = {
+    "name": "名称",
+    "type": "类型",
+    "ip": "IP",
+    "hostname": "主机名",
+    "vendor": "厂商",
+    "mac": "MAC",
+    "ports": "开放端口",
+    "services": "服务",
+    "status": "状态",
+}
+DEFAULT_COLUMNS = ["name", "type", "ip", "hostname", "vendor", "ports", "status"]
+
+
+# --------------------------------------------------------------------------
+# 小工具
+# --------------------------------------------------------------------------
+
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def run_text(cmd, timeout=10) -> str:
+    """执行命令，返回 stdout 文本（失败返回空串）。"""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def run_stream(cmd, seconds: float, stop_when=None, grace: float = 0.25):
+    """执行会持续输出命令（如 dns-sd），收集输出行。
+
+    seconds 为最长等待；若提供 stop_when(lines)->bool，满足后会在 grace 秒的
+    缓冲窗口后提前结束（用于拿到 TXT 等紧随其后的行）。
+    """
+    try:
+        p = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    lines = []
+    lock = threading.Lock()
+
+    def reader():
+        try:
+            for line in p.stdout:
+                with lock:
+                    lines.append(line.rstrip("\n"))
+                if len(lines) > 5000:      # 兜底，防止异常输出撑爆内存
+                    break
+        except (OSError, ValueError):
+            pass
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    deadline = time.time() + seconds
+    hit = False
+    while time.time() < deadline:
+        if stop_when is not None:
+            with lock:
+                snapshot = list(lines)
+            try:
+                if stop_when(snapshot):
+                    hit = True
+                    break
+            except Exception:                       # noqa: BLE001 - 判断函数异常不影响收集
+                pass
+        if not t.is_alive():
+            break
+        time.sleep(0.02)
+
+    if hit:                                        # 给 TXT 等后续行一点时间
+        grace_end = min(time.time() + grace, deadline)
+        while time.time() < grace_end and t.is_alive():
+            time.sleep(0.02)
+
+    for action in (p.terminate, p.kill):
+        try:
+            action()
+            p.wait(timeout=1)
+            break
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+    with lock:
+        return list(lines)
+
+
+def dwidth(s: str) -> int:
+    """按终端显示宽度计算字符串长度（中日韩全角字符占 2 列）。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - dwidth(s))
+
+
+def truncate(s: str, width: int) -> str:
+    """按显示宽度截断，超出部分用 … 表示。"""
+    if dwidth(s) <= width:
+        return s
+    out, used = [], 0
+    for ch in s:
+        w = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+# --------------------------------------------------------------------------
+# 网络信息 / 扫描
+# --------------------------------------------------------------------------
+
+def parse_ifconfig(text: str):
+    """解析 `ifconfig` 输出 → [{iface, ip, netmask}, ...]"""
+    result, current = [], None
+    for line in text.splitlines():
+        m = re.match(r"^([a-z0-9]+): flags=", line)
+        if m:
+            current = m.group(1)
+            continue
+        m = re.match(r"\s+inet (\d+\.\d+\.\d+\.\d+) netmask (0x[0-9a-fA-F]+)", line)
+        if m and current:
+            result.append({
+                "iface": current,
+                "ip": m.group(1),
+                "netmask": m.group(2),
+            })
+    return result
+
+
+def netmask_to_prefix(hexmask: str) -> int:
+    return bin(int(hexmask, 16)).count("1")
+
+
+def parse_gateway(route_text: str):
+    """从 `route -n get default` 输出解析网关 IP。"""
+    m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", route_text)
+    return m.group(1) if m else None
+
+
+def default_gateway():
+    return parse_gateway(run_text(["route", "-n", "get", "default"]))
+
+
+def system_network(iface=None, cidr=None):
+    """确定要扫描的网段。返回 iface / ip / prefix / network / source。"""
+    ifaces = parse_ifconfig(run_text(["ifconfig"]))
+
+    if cidr:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise SystemExit(
+                f"lanmac: 无效网段 {cidr!r}（示例: 192.168.1.0/24）") from exc
+        iface_name, local_ip = iface or "?", None
+        for cand in ifaces:                     # 若指定网段包含本机地址，顺带标出本机
+            if ipaddress.ip_address(cand["ip"]) in net:
+                iface_name, local_ip = cand["iface"], cand["ip"]
+                break
+        return {
+            "iface": iface_name,
+            "ip": local_ip,
+            "prefix": net.prefixlen,
+            "network": net,
+            "source": "user",
+        }
+
+    default_if = None
+    m = re.search(r"interface:\s*(\w+)", run_text(["route", "-n", "get", "default"]))
+    if m:
+        default_if = m.group(1)
+
+    chosen = None
+    if iface:
+        chosen = next((i for i in ifaces if i["iface"] == iface), None)
+        if chosen is None:
+            raise SystemExit(
+                f"lanmac: 网卡 {iface!r} 不存在或没有 IPv4 地址（可用 ifconfig 查看）")
+    if chosen is None and default_if:
+        chosen = next((i for i in ifaces if i["iface"] == default_if), None)
+    if chosen is None:
+        # 退而求其次：常见的私网地址
+        for cand in ifaces:
+            if re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", cand["ip"]):
+                chosen = cand
+                break
+    if chosen is None:
+        raise SystemExit("lanmac: 找不到可用的局域网接口，请用 -s/--subnet 指定网段")
+
+    prefix = netmask_to_prefix(chosen["netmask"])
+    net = ipaddress.ip_network(f'{chosen["ip"]}/{prefix}', strict=False)
+    return {
+        "iface": chosen["iface"],
+        "ip": chosen["ip"],
+        "prefix": prefix,
+        "network": net,
+        "source": "auto",
+    }
+
+
+def ping_host(ip: str, timeout: float) -> bool:
+    try:
+        p = subprocess.run(
+            ["ping", "-c", "1", "-t", "1", "-W", str(int(timeout * 1000)), str(ip)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return p.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def sweep(network, timeout: float, workers: int = 64):
+    """并行 ping 扫描，返回存活 IP 集合。"""
+    hosts = [str(h) for h in network.hosts()]
+    if not hosts:
+        return set()
+    alive = set()
+    with ThreadPoolExecutor(max_workers=min(workers, len(hosts))) as ex:
+        futures = {ex.submit(ping_host, ip, timeout): ip for ip in hosts}
+        for fut in as_completed(futures):
+            if fut.result():
+                alive.add(futures[fut])
+    return alive
+
+
+ARP_RE = re.compile(
+    r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{2,}|\(incomplete\)) on (\w+)"
+)
+
+
+def parse_arp(text: str):
+    """解析 `arp -an` → {ip: {"mac":..., "iface":...}}"""
+    table = {}
+    for line in text.splitlines():
+        m = ARP_RE.search(line)
+        if not m:
+            continue
+        ip, mac, iface = m.group(1), m.group(2), m.group(3)
+        if mac == "(incomplete)":
+            continue
+        table[ip] = {"mac": mac, "iface": iface}
+    return table
+
+
+def arp_table():
+    return parse_arp(run_text(["arp", "-an"]))
+
+
+# --------------------------------------------------------------------------
+# OUI 厂商库
+# --------------------------------------------------------------------------
+
+def load_oui(explicit=None):
+    """加载 OUI 厂商库。返回 (table, 来源路径或 None)。"""
+    candidates = [explicit] if explicit else list(OUI_PATHS)
+    if not explicit:
+        candidates.append(os.path.expanduser("~/.lanmac/oui.txt"))
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                table = {}
+                for line in f:
+                    parts = line.split(None, 1)
+                    if len(parts) == 2 and re.fullmatch(r"[0-9A-Fa-f]{6}", parts[0]):
+                        table[parts[0].upper()] = parts[1].strip()
+                if table:
+                    return table, path
+        except OSError:
+            continue
+    return dict(FALLBACK_OUI), None
+
+
+def normalize_mac(mac: str) -> str:
+    """把 c8:cd:55:14:c:9a 这类补齐成 c8:cd:55:14:0c:9a。"""
+    if not mac:
+        return mac
+    parts = re.split(r"[^0-9A-Fa-f]", mac)
+    parts = [p for p in parts if p]
+    if len(parts) != 6:
+        return mac
+    return ":".join(p.zfill(2).lower() for p in parts)
+
+
+def mac_is_random(mac: str) -> bool:
+    """本地管理位（第一个字节的 0x02）为 1 → 随机 MAC（隐私地址）。"""
+    clean = re.sub(r"[^0-9A-Fa-f]", "", mac or "")
+    if len(clean) < 2:
+        return False
+    return bool(int(clean[:2], 16) & 0x02)
+
+
+def vendor_for(mac: str, oui) -> str:
+    clean = re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
+    if len(clean) < 6:
+        return ""
+    if mac_is_random(clean):
+        return "随机 MAC"
+    return oui.get(clean[:6], "")
+
+
+# --------------------------------------------------------------------------
+# Bonjour / mDNS
+# --------------------------------------------------------------------------
+
+def parse_browse(lines, service: str):
+    """解析 `dns-sd -B` 输出，返回出现过的实例名列表。"""
+    names = []
+    for line in lines:
+        parts = line.split()
+        # 形如: 11:31:33.388  Add        2  14 local.  _ssh._tcp.  xlsd的Mac mini
+        if len(parts) < 7 or parts[1] not in ("Add", "Rmv"):
+            continue
+        if parts[1] != "Add":
+            continue
+        svc = parts[5].rstrip(".")
+        if svc != service.rstrip("."):
+            continue
+        name = " ".join(parts[6:]).strip()
+        if name:
+            names.append(name)
+    return names
+
+
+LOOKUP_RE = re.compile(r"can be reached at (\S+?):(\d+)")
+
+
+def parse_lookup(lines):
+    """解析 `dns-sd -L` 输出 → (host, port, txt dict)"""
+    host, port, txt = None, None, {}
+    for line in lines:
+        m = LOOKUP_RE.search(line)
+        if m:
+            host = m.group(1).rstrip(".")
+            port = int(m.group(2))
+        for k, v in re.findall(r"(\w+)=(\S+)", line):
+            txt.setdefault(k, v)
+    return host, port, txt
+
+
+def resolve_host(host: str, network=None):
+    """用 mDNS 解析 *.local → IPv4；优先返回当前网段内的地址。"""
+    host = host.rstrip(".")
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+    except (socket.gaierror, OSError):
+        return None
+    ips = []
+    for info in infos:
+        ip = info[4][0]
+        if ip.startswith("127.") or ip.startswith("169.254."):
+            continue
+        if ip not in ips:
+            ips.append(ip)
+    if network is not None:
+        inside = [ip for ip in ips if ipaddress.ip_address(ip) in network]
+        if inside:
+            return inside[0]
+    return ips[0] if ips else None
+
+
+def resolve_via_dns_sd(host: str, seconds: float, network=None):
+    """getaddrinfo 失败时，退回 `dns-sd -G v4`。"""
+    if not have("dns-sd"):
+        return None
+    lines = run_stream(["dns-sd", "-G", "v4", host.rstrip(".") + "."], seconds)
+    ips = []
+    for line in lines:
+        if " Add " not in f" {line} ":
+            continue
+        for ip in re.findall(r"\b(\d+\.\d+\.\d+\.\d+)\b", line):
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            if ip not in ips:
+                ips.append(ip)
+    if network is not None:
+        inside = [ip for ip in ips if ipaddress.ip_address(ip) in network]
+        if inside:
+            return inside[0]
+    return ips[0] if ips else None
+
+
+def browse_service(service: str, seconds: float):
+    if not have("dns-sd"):
+        return []
+    lines = run_stream(["dns-sd", "-B", service, "local."], seconds)
+    return parse_browse(lines, service)
+
+
+def clean_instance_name(name: str, service: str) -> str:
+    """整理 Bonjour 实例名（去掉 AirPlay 音频类的 MAC@ 前缀等）。"""
+    name = name.strip()
+    if "@" in name:
+        head, tail = name.split("@", 1)
+        if re.fullmatch(r"[0-9A-Fa-f]{8,}", head):
+            name = tail.strip()
+    return name
+
+
+def lookup_device(name: str, services, seconds: float, network=None):
+    """解析单个实例：主机名 / 端口 / TXT(机型) / IP。"""
+    preferred = "_airplay._tcp" if "_airplay._tcp" in services else sorted(services)[0]
+    lines = run_stream(
+        ["dns-sd", "-L", name, preferred, "local."], seconds,
+        stop_when=lambda ls: any("can be reached at" in l for l in ls),
+    )
+    host, port, txt = parse_lookup(lines)
+    ip = None
+    if host:
+        ip = resolve_host(host, network) or resolve_via_dns_sd(host, seconds, network)
+    return {"hostname": host, "port": port, "txt": txt, "ip": ip}
+
+
+def probe_port(ip: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def smb_name(ip: str, timeout: float = 1.5):
+    """用 `smbutil status` 拿 Windows/Samba 的机器名。"""
+    if not have("smbutil"):
+        return None
+    try:
+        out = subprocess.run(
+            ["smbutil", "status", ip], capture_output=True, text=True, timeout=timeout
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"^Server:\s*(.+)$", out or "", re.M)
+    return m.group(1).strip() if m else None
+
+
+# --------------------------------------------------------------------------
+# 类型判定
+# --------------------------------------------------------------------------
+
+def model_label(model: str):
+    if not model:
+        return ""
+    return MODEL_NAMES.get(model, model)
+
+
+def open_ports(dev):
+    return {int(p) for p, on in (dev.get("ports") or {}).items() if on}
+
+
+def classify_type(dev) -> str:
+    """按 Bonjour 机型/服务 → 名称 → 端口 → 厂商 的顺序判定设备类型。"""
+    model = (dev.get("model") or "").lower()
+    model_name = (dev.get("model_name") or "").lower()
+    name = (dev.get("name") or "").lower()
+    host = (dev.get("hostname") or "").lower()
+    vendor = (dev.get("vendor") or "").lower()
+    services = dev.get("services") or set()
+    ports = open_ports(dev)
+    blob = " ".join([name, host, model_name])
+
+    if dev.get("is_gateway"):
+        return "router"
+    if any(k in model for k in ("macbook", "imac", "macmini", "macpro", "macstudio")):
+        return "mac"
+    if any(k in blob for k in ("macbook", "mac mini", "imac", "mac studio", "mac pro")):
+        return "mac"
+    if "audioaccessory" in model or "homepod" in blob:
+        return "speaker"
+    if "appletv" in model or "apple tv" in blob:
+        return "tv"
+    if "iphone" in model or "iphone" in blob:
+        return "phone"
+    if "ipad" in model or "ipad" in blob:
+        return "tablet"
+    if "_ipp._tcp" in services or "_printer._tcp" in services:
+        return "printer"
+    if "_googlecast._tcp" in services:
+        return "tv"
+    if "_hap._tcp" in services:
+        return "iot"
+    if any(k in blob for k in ("printer", "laserjet", "laser ns", "mfp", "ricoh",
+                               "sharp sf", "epson", "canon", "brother", "xerox")):
+        return "printer"
+    if any(k in blob for k in ("router", "gateway", "access point", "unifi",
+                               "openwrt", "rt-", "mi-router")):
+        return "router"
+    if any(k in blob for k in ("diskstation", "synology", "qnap", " nas")):
+        return "nas"
+    if any(k in blob for k in ("iphone", "ipad", "android", "redmi", "pixel",
+                               "galaxy", "honor", "oneplus")):
+        return "phone"
+    if 62078 in ports:
+        return "phone"
+    if 9100 in ports or 631 in ports:
+        return "printer"
+    if 3389 in ports:
+        return "pc"
+    if {5000, 5001} & ports:
+        return "nas"
+    if vendor.startswith("apple"):
+        if 62078 in ports:
+            return "phone"
+        if ports & {445, 5900, 22, 7000}:
+            return "mac"
+        return "apple"
+    for keywords, type_key in VENDOR_TYPE_HINTS:
+        if any(k in vendor for k in keywords):
+            return type_key
+    if 445 in ports:
+        return "pc"
+    if 22 in ports:
+        return "linux"
+    return "unknown"
+
+
+def type_label(type_key: str) -> str:
+    return TYPE_LABELS.get(type_key, type_key)
+
+
+def parse_type_filter(spec: str):
+    """解析 --type 参数（key 或中文标签，逗号分隔）。"""
+    keys = []
+    for raw in (spec or "").split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        low = token.lower()
+        if low in TYPE_LABELS:
+            keys.append(low)
+        elif token in TYPE_BY_LABEL:
+            keys.append(TYPE_BY_LABEL[token])
+        else:
+            raise SystemExit(
+                "lanmac: 未知类型 %r，可选: %s（或中文：%s）"
+                % (token, ", ".join(TYPE_ORDER),
+                   "、".join(TYPE_LABELS[k] for k in TYPE_ORDER)))
+    return keys
+
+
+# --------------------------------------------------------------------------
+# 发现主流程
+# --------------------------------------------------------------------------
+
+def discover(args):
+    started = time.time()
+    netinfo = system_network(args.iface, args.subnet)
+    network = netinfo["network"]
+    gateway = default_gateway()
+    local_ip = netinfo["ip"]
+    local_name = run_text(["scutil", "--get", "ComputerName"]).strip()
+    oui, oui_source = load_oui(getattr(args, "oui_file", None))
+
+    warnings = []
+    arp = arp_table()
+
+    # ---- ping 扫描 + Bonjour 浏览并行 ----
+    def do_sweep():
+        if args.fast or args.no_scan:
+            return None
+        return sweep(network, args.timeout)
+
+    def do_browse():
+        if args.no_bonjour or not have("dns-sd"):
+            return None
+        found = {}
+        services = [s for s, _ in SERVICES]
+        with ThreadPoolExecutor(max_workers=len(services)) as ex:
+            futures = {
+                ex.submit(browse_service, svc, args.browse): svc for svc in services
+            }
+            for fut in as_completed(futures):
+                svc = futures[fut]
+                try:
+                    names = fut.result()
+                except Exception:                   # noqa: BLE001 - 单服务失败不影响整体
+                    names = []
+                for name in names:
+                    found.setdefault(name, {"services": set()})["services"].add(svc)
+        return found
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_sweep = ex.submit(do_sweep)
+        f_browse = ex.submit(do_browse)
+        swept = f_sweep.result()
+        browsed = f_browse.result()
+
+    if swept is None:
+        alive = set(arp.keys()) if args.fast else set()
+        warnings.append("已跳过 ping 扫描，在线状态按 ARP 缓存判断")
+    else:
+        alive = swept
+    if browsed is None:
+        instances = {}
+        warnings.append("未执行 Bonjour 发现（dns-sd 不可用或已用 --no-bonjour）")
+    else:
+        instances = browsed
+
+    # ---- 逐实例解析（并发） ----
+    if instances:
+        with ThreadPoolExecutor(max_workers=min(16, len(instances))) as ex:
+            futures = {
+                ex.submit(
+                    lookup_device, name, inst["services"], args.lookup_timeout, network
+                ): name
+                for name, inst in instances.items()
+            }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    data = fut.result()
+                except Exception:                   # noqa: BLE001
+                    data = {}
+                instances[name].update(data)
+
+    # ---- 汇总设备 ----
+    devices = {}
+    by_ip = {}
+
+    def record(ip):
+        if ip in by_ip:
+            return by_ip[ip]
+        dev = {
+            "name": None,
+            "name_source": None,
+            "name_pri": 0,
+            "hostname": None,
+            "ip": ip,
+            "mac": arp.get(ip, {}).get("mac") if ip else None,
+            "vendor": "",
+            "model": None,
+            "model_name": None,
+            "services": set(),
+            "ports": {},
+            "online": False,
+            "arp_cached": bool(ip and ip in arp),
+            "type": "unknown",
+            "is_local": False,
+            "is_gateway": False,
+        }
+        by_ip[ip] = dev
+        devices[ip or "?"] = dev
+        return dev
+
+    for name, inst in instances.items():
+        ip = inst.get("ip")
+        dev = record(ip) if ip else {
+            "name": None, "name_source": None, "name_pri": 0, "hostname": inst.get("hostname"),
+            "ip": None, "mac": None, "vendor": "", "model": None, "model_name": None,
+            "services": set(), "ports": {}, "online": False, "arp_cached": False,
+            "type": "unknown", "is_local": False, "is_gateway": False,
+        }
+        if not ip:
+            devices["name:" + name] = dev
+        priority = max((NAME_PRIORITY.get(s, 10) for s in inst["services"]), default=10)
+        if dev.get("name") is None or priority > dev.get("name_pri", 0):
+            dev["name"] = clean_instance_name(name, sorted(inst["services"])[0])
+            dev["name_pri"] = priority
+            dev["name_source"] = "bonjour"
+        dev["services"] |= inst.get("services", set())
+        dev["hostname"] = dev["hostname"] or inst.get("hostname")
+        txt = inst.get("txt") or {}
+        if txt.get("model") and not dev["model"]:
+            dev["model"] = txt["model"]
+            dev["model_name"] = model_label(txt["model"])
+
+    if not args.fast and not args.no_scan:
+        for ip in alive:
+            record(ip)
+    if args.stale or args.fast:
+        for ip in arp:
+            record(ip)
+    if local_ip:
+        record(local_ip)
+        devices[local_ip]["online"] = True
+        devices[local_ip]["name"] = devices[local_ip]["name"] or local_name or None
+        devices[local_ip]["name_source"] = devices[local_ip]["name_source"] or "local"
+        devices[local_ip]["is_local"] = True
+
+    # ---- 端口探测（默认开启，--no-probe/--fast 关闭） ----
+    probe_ports = None
+    if args.ports:
+        probe_ports = [int(p) for p in args.ports.split(",") if p.strip()]
+    elif not (args.no_probe or args.fast):
+        probe_ports = DEFAULT_PORTS
+    probed = bool(probe_ports)
+    if probe_ports:
+        targets = [d for d in devices.values() if d.get("ip")]
+        with ThreadPoolExecutor(max_workers=128) as ex:
+            futures = {
+                ex.submit(probe_port, d["ip"], port): (id(d), port)
+                for d in targets for port in probe_ports
+            }
+            by_id = {id(d): d for d in targets}
+            for fut in as_completed(futures):
+                did, port = futures[fut]
+                try:
+                    is_open = fut.result()
+                except Exception:                   # noqa: BLE001
+                    is_open = False
+                by_id[did]["ports"][str(port)] = is_open
+
+    # ---- 补 MAC / 厂商 / 在线状态 ----
+    for dev in devices.values():
+        ip = dev["ip"]
+        if ip and ip in arp:
+            dev["mac"] = normalize_mac(dev["mac"] or arp[ip]["mac"])
+        if dev["mac"]:
+            dev["vendor"] = vendor_for(dev["mac"], oui)
+        dev["online"] = bool(ip and ip in alive)
+        if args.fast or args.no_scan:
+            dev["online"] = bool(ip and ip in arp)
+        if not dev["model_name"]:
+            dev["model_name"] = model_label(dev["model"])
+        dev["is_gateway"] = bool(gateway and ip == gateway)
+        if dev["is_gateway"] and not dev["name"]:
+            dev["name"] = "网关（路由器）"
+            dev["name_source"] = "gateway"
+
+    # ---- 补名称（可选，SMB/NetBIOS） ----
+    if getattr(args, "names", False):
+        targets = [d for d in devices.values()
+                   if d.get("ip") and d.get("online") and not d.get("name")]
+        if targets:
+            with ThreadPoolExecutor(max_workers=32) as ex:
+                futures = {ex.submit(smb_name, d["ip"]): d for d in targets}
+                for fut in as_completed(futures):
+                    dev = futures[fut]
+                    try:
+                        name = fut.result()
+                    except Exception:               # noqa: BLE001
+                        name = None
+                    if name:
+                        dev["name"] = name
+                        dev["name_source"] = "smb"
+
+    # ---- 判定类型 ----
+    for dev in devices.values():
+        dev["type"] = classify_type(dev)
+        # Bonjour 机型能证明是 Apple 设备时，厂商列直接给 Apple（设备可能是随机 MAC）
+        if (dev["model"] or "").startswith(("Mac", "AppleTV", "AudioAccessory",
+                                            "iPhone", "iPad", "Watch")):
+            dev["vendor"] = "Apple"
+        elif dev["type"] in ("mac", "apple") and dev["vendor"] in ("", "随机 MAC"):
+            dev["vendor"] = "Apple"
+
+    result = {
+        "version": VERSION,
+        "scanned": {
+            "subnet": str(network),
+            "iface": netinfo["iface"],
+            "local_ip": local_ip,
+            "local_name": local_name,
+            "gateway": gateway,
+            "duration_s": round(time.time() - started, 2),
+            "alive_hosts": len(alive),
+            "bonjour_devices": len(instances),
+            "probed": probed,
+            "oui_source": oui_source,
+        },
+        "warnings": warnings,
+        "devices": list(devices.values()),
+    }
+    return result
+
+
+# --------------------------------------------------------------------------
+# 过滤 / 排序 / 输出
+# --------------------------------------------------------------------------
+
+def filter_devices(devices, args):
+    out = list(devices)
+    if getattr(args, "filter", None):
+        try:
+            pat = re.compile(args.filter, re.I)
+        except re.error as exc:
+            raise SystemExit(f"lanmac: 无效的 --filter 正则: {exc}")
+        fields = ("name", "hostname", "ip", "model_name", "vendor",
+                  "type", "mac", "hostname")
+        out = [d for d in out
+               if any(pat.search(str(d.get(k) or "")) for k in fields)]
+    if getattr(args, "mac", False):
+        out = [d for d in out if d.get("type") == "mac"]
+    types = getattr(args, "types", None) or []
+    if types:
+        out = [d for d in out if d.get("type") in types]
+    if getattr(args, "named", False):
+        out = [d for d in out if d.get("name")]
+    if getattr(args, "keywords", None):
+        kws = [k.lower() for k in args.keywords]
+        def blob(d):
+            fields = ("name", "hostname", "ip", "model_name", "vendor")
+            return " ".join([str(d.get(f) or "") for f in fields]
+                            + [type_label(d.get("type") or "")]).lower()
+        out = [d for d in out if any(k in blob(d) for k in kws)]
+    return out
+
+
+def sort_devices(devices, key):
+    if key == "name":
+        return sorted(devices, key=lambda d: (d.get("name") or "~").lower())
+    if key == "model":
+        return sorted(devices, key=lambda d: (d.get("model_name") or "~",
+                                              d.get("name") or ""))
+    if key == "type":
+        order = {k: i for i, k in enumerate(TYPE_ORDER)}
+        return sorted(devices, key=lambda d: (order.get(d.get("type"), 99),
+                                              _ip_key(d.get("ip"))))
+    return sorted(devices, key=lambda d: _ip_key(d.get("ip")))
+
+
+def _ip_key(ip):
+    if not ip:
+        return (1, 0)
+    try:
+        return (0, int(ipaddress.ip_address(ip)))
+    except ValueError:
+        return (1, 0)
+
+
+def service_labels(services):
+    labels = {SERVICE_LABELS.get(s, s) for s in services}
+    return [lbl for lbl in SERVICE_ORDER if lbl in labels]
+
+
+def service_text(services) -> str:
+    # 去重（_ipp 与 _printer 都显示“打印”）
+    deduped = []
+    for lbl in service_labels(services):
+        if lbl not in deduped:
+            deduped.append(lbl)
+    return " / ".join(deduped) if deduped else "-"
+
+
+def open_port_text(dev) -> str:
+    ports = sorted(open_ports(dev))
+    return ",".join(str(p) for p in ports) if ports else "-"
+
+
+def cell_value(dev, column):
+    if column == "name":
+        return dev.get("name") or "-"
+    if column == "type":
+        return type_label(dev.get("type") or "unknown")
+    if column == "ip":
+        return dev.get("ip") or "-"
+    if column == "hostname":
+        return (dev.get("hostname") or "-").replace(".local", "")
+    if column == "vendor":
+        return truncate(dev.get("vendor") or "-", 34)
+    if column == "mac":
+        return dev.get("mac") or "-"
+    if column == "ports":
+        return open_port_text(dev)
+    if column == "services":
+        return service_text(dev.get("services") or set())
+    if column == "status":
+        if dev.get("is_local"):
+            return "本机"
+        if dev.get("online"):
+            return "在线"
+        if dev.get("arp_cached"):
+            return "ARP缓存"
+        if dev.get("ip"):
+            return "无响应"
+        return "IP 未知"
+    return "-"
+
+
+def render_table(devices, args):
+    columns = args.columns
+    headers = [COLUMN_LABELS[c] for c in columns]
+    rows = [[cell_value(d, c) for c in columns] for d in devices]
+
+    widths = [dwidth(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], dwidth(cell))
+
+    lines = ["  ".join(pad(h, widths[i]) for i, h in enumerate(headers)).rstrip(),
+             "  ".join("-" * widths[i] for i in range(len(headers)))]
+    for row in rows:
+        lines.append("  ".join(pad(c, widths[i]) for i, c in enumerate(row)).rstrip())
+    return "\n".join(lines)
+
+
+def print_report(result, args):
+    scan = result["scanned"]
+    devs = result["devices"]
+
+    if args.json:
+        payload = {
+            "version": result["version"],
+            "scanned": scan,
+            "warnings": result["warnings"],
+            "devices": [
+                {
+                    "name": d["name"],
+                    "name_source": d["name_source"],
+                    "type": d["type"],
+                    "type_label": type_label(d["type"]),
+                    "model": d["model"],
+                    "model_name": d["model_name"] or None,
+                    "ip": d["ip"],
+                    "hostname": d["hostname"],
+                    "mac": d["mac"],
+                    "vendor": d["vendor"],
+                    "services": service_text(d["services"]).split(" / ")
+                               if d["services"] else [],
+                    "service_types": sorted(d["services"]),
+                    "ports": d["ports"],
+                    "open_ports": sorted(open_ports(d)),
+                    "online": d["online"],
+                    "arp_cached": d["arp_cached"],
+                    "is_local": d["is_local"],
+                    "is_gateway": d["is_gateway"],
+                }
+                for d in devs
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    title = f"lanmac {VERSION}  ·  网段 {scan['subnet']} ({scan['iface']})"
+    if scan.get("local_ip"):
+        title += f"  ·  本机 {scan['local_ip']}（{scan['local_name'] or '-'}）"
+    print(title)
+    online = result.get("online_total", sum(1 for d in devs if d["online"]))
+    total = result.get("total", len(devs))
+    shown = "" if total == len(devs) else "（显示 %d 行）" % len(devs)
+    if scan.get("probed"):
+        print("发现 %d 台设备 · 在线 %d · 扫描耗时 %.1fs%s"
+              % (total, online, scan["duration_s"], shown))
+    else:
+        print("发现 %d 台设备 · 在线 %d（未探测端口）· 扫描耗时 %.1fs%s"
+              % (total, online, scan["duration_s"], shown))
+    for w in result["warnings"]:
+        print("! " + w)
+    print()
+
+    if not devs:
+        print("没有发现设备。可能原因：\n"
+              "  · 终端没有「本地网络」权限 → 系统设置 > 隐私与安全性 > 本地网络\n"
+              "  · 目标网段不对（可试 -s 或 -i）\n"
+              "  · 目标与你不在此网段（如连接了 VPN）")
+        return
+
+    print(render_table(devs, args))
+
+    # 类型汇总（基于过滤后的全量，不受 --limit 影响）
+    counts = result.get("type_counts") or {}
+    parts = [f"{TYPE_LABELS[k]} {counts[k]}"
+             for k in TYPE_ORDER if k in counts]
+    print("\n共 %d 台：%s。" % (total, "，".join(parts)))
+
+    if any(d.get("arp_cached") and not d["online"] for d in devs):
+        print("说明：「ARP缓存」= 有 ARP 记录但 ping 无响应（设备休眠或防火墙禁 ping）。")
+    unknown = counts.get("unknown", 0)
+    if unknown and not (args.ports or args.names):
+        print("提示：%d 台类型未知，可用 --names（读 SMB 机器名）或 -p 指定更多端口提高识别率。"
+              % unknown)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="lanmac",
+        description="局域网设备发现 / IP 查询（macOS，默认枚举所有设备类型）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  lanmac                       扫描当前网段所有设备（默认）
+  lanmac -m                    只看 Mac 电脑
+  lanmac --type printer,phone  只看打印机和手机
+  lanmac -j                    输出 JSON
+  lanmac --columns name,type,ip,vendor,ports,status
+  lanmac --fast                快速模式（只读 ARP，约 3 秒）
+  lanmac 192.168.10.172        只看指定 IP
+  lanmac -f 'MacBook Pro'      按名称/厂商/类型正则过滤
+""",
+    )
+    p.add_argument("keywords", nargs="*", metavar="关键字",
+                   help="按 IP / 名称 / 厂商 / 类型关键字过滤（可多个）")
+    p.add_argument("-s", "--subnet", help="扫描网段，如 192.168.1.0/24（默认自动）")
+    p.add_argument("-i", "--iface", help="指定网卡接口，如 en0（默认跟随默认路由）")
+    p.add_argument("-t", "--timeout", type=float, default=0.8,
+                   help="ping 单机等待秒数（默认 0.8）")
+    p.add_argument("-b", "--browse", type=float, default=5.0,
+                   help="Bonjour 浏览时长秒数（默认 5）")
+    p.add_argument("--lookup-timeout", type=float, default=3.0,
+                   help="单个设备 mDNS 解析时长秒数（默认 3）")
+    p.add_argument("-p", "--ports", help="自定义探测端口，逗号分隔（默认探测常见端口）")
+    p.add_argument("--no-probe", action="store_true", help="不探测端口（更快，但类型判定变弱）")
+    p.add_argument("-y", "--type", dest="type_spec", metavar="TYPES",
+                   help="按类型过滤，逗号分隔：mac,phone,printer,router,tv,nas,"
+                        "camera,iot,speaker,pc,linux,tablet,apple,unknown（也接受中文）")
+    p.add_argument("-m", "--mac", action="store_true", help="只显示 Mac 电脑")
+    p.add_argument("-n", "--names", action="store_true",
+                   help="用 SMB/NetBIOS 补全无 Bonjour 名称的设备（较慢）")
+    p.add_argument("--stale", action="store_true",
+                   help="同时显示仅在 ARP 缓存里、当前 ping 不通的设备")
+    p.add_argument("-f", "--filter", help="按名称/厂商/IP/类型正则过滤")
+    p.add_argument("-j", "--json", action="store_true", help="输出 JSON")
+    p.add_argument("--fast", action="store_true",
+                   help="快速模式：跳过 ping 与端口探测，仅用 ARP 缓存（约 3 秒）")
+    p.add_argument("--no-scan", action="store_true", help="跳过 ping 扫描")
+    p.add_argument("--no-bonjour", action="store_true", help="跳过 Bonjour 发现")
+    p.add_argument("--oui-file", help="自定义 OUI 厂商库文件（默认找 nmap 的 nmap-mac-prefixes）")
+    p.add_argument("--columns", help="表格列，逗号分隔：name,type,ip,hostname,vendor,"
+                                     "mac,ports,services,status")
+    p.add_argument("--limit", type=int, help="只显示前 N 行")
+    p.add_argument("--sort", choices=["ip", "name", "model", "type"], default="ip",
+                   help="排序方式（默认 ip）")
+    p.add_argument("-V", "--version", action="version", version=f"lanmac {VERSION}")
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    args.types = parse_type_filter(args.type_spec) if args.type_spec else []
+    args.columns_explicit = bool(args.columns)
+    if args.columns:
+        cols = [c.strip().lower() for c in args.columns.split(",") if c.strip()]
+        bad = [c for c in cols if c not in COLUMN_LABELS]
+        if bad:
+            raise SystemExit("lanmac: 未知列 %r，可选: %s"
+                             % (",".join(bad), ",".join(COLUMN_LABELS)))
+        args.columns = cols
+    else:
+        args.columns = list(DEFAULT_COLUMNS)
+    if args.fast:
+        args.browse = min(args.browse, 3.0)
+        args.lookup_timeout = min(args.lookup_timeout, 2.0)
+
+    try:
+        result = discover(args)
+    except KeyboardInterrupt:
+        print("\n已取消", file=sys.stderr)
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:                            # noqa: BLE001
+        print(f"lanmac: 扫描失败: {exc}", file=sys.stderr)
+        return 1
+
+    devs = filter_devices(result["devices"], args)
+    devs = sort_devices(devs, args.sort)
+    result["total"] = len(devs)
+    result["online_total"] = sum(1 for d in devs if d["online"])
+    counts = {}
+    for d in devs:
+        counts[d["type"]] = counts.get(d["type"], 0) + 1
+    result["type_counts"] = counts
+    if not args.columns_explicit and not result["scanned"].get("probed"):
+        args.columns = [c for c in args.columns if c != "ports"]
+    if args.limit is not None and args.limit >= 0:
+        devs = devs[:args.limit]
+    result["devices"] = devs
+    print_report(result, args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

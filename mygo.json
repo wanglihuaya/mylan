@@ -1,0 +1,27 @@
+{
+  "name": "mylan",
+  "identifier": "app.mylan",
+  "version": "0.1.0",
+  "out": "build",
+  "updates": {
+    "publicKey": "rDq9aylOc+BfB7Y8/apM1UzPbCCef/N5LQqCg15hvh8=",
+    "github": "wanglihuaya/mylan"
+  },
+  "macos": {
+    "infoPlist": {
+      "LSUIElement": true,
+      "NSLocalNetworkUsageDescription": "mylan 需要访问本地网络，才能发现同一局域网里的设备。",
+      "NSBonjourServices": [
+        "_airplay._tcp",
+        "_companion-link._tcp",
+        "_ssh._tcp",
+        "_smb._tcp",
+        "_rfb._tcp",
+        "_ipp._tcp",
+        "_printer._tcp",
+        "_googlecast._tcp",
+        "_hap._tcp"
+      ]
+    }
+  }
+}
