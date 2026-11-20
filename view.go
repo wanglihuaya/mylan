@@ -415,7 +415,7 @@ func (a *app) problem(c *ui.Context, k ink, title, detail string, permission boo
 	ui.Column(c).Grow(1).Center().Gap(6).Padding(24, 32).Children(func() {
 		ui.Text(c, title).FontSize(14).FontWeight(600).TextAlign(ui.Center)
 		ui.Text(c, detail).FontSize(12).TextColor(k.muted).TextAlign(ui.Center).LineHeight(1.4)
-		if permission {
+		if permission && runtime.GOOS == "darwin" {
 			ui.Text(c, "系统设置 → 隐私与安全性 → 本地网络 → 允许 mylan。").
 				FontSize(12).TextColor(k.muted).TextAlign(ui.Center).LineHeight(1.4)
 		}

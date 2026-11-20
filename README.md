@@ -16,10 +16,8 @@ Click the menu-bar icon to open the panel: a list, search, a type filter, a note
 | --- | --- |
 | macOS（Apple 芯片） | `mylan 0.1.0 arm64.dmg` |
 | macOS（Intel） | `mylan 0.1.0 amd64.dmg` |
-| Windows x64 | `mylan Setup 0.1.0 amd64.exe` |
-| Windows ARM | `mylan Setup 0.1.0 arm64.exe` |
-| Linux x64 | `mylan-0.1.0-linux-amd64.tar.gz`、`mylan_0.1.0_amd64.deb` |
-| Linux ARM | `mylan-0.1.0-linux-arm64.tar.gz`、`mylan_0.1.0_arm64.deb` |
+
+扫描使用 macOS 的 `dns-sd`、`arp` 和 `ping`。Windows 和 Linux 目前不能发现设备，所以不发布这两个系统的安装包。
 
 ### macOS
 
@@ -29,20 +27,6 @@ Click the menu-bar icon to open the panel: a list, search, a type filter, a note
 - 扫描使用系统自带的 `python3`，还要用到 `ping`、`arp`、`dns-sd` 和 `smbutil`。
 - 完整扫描会 ping 当前网段，大约几秒。设置里可以改成快速模式、包含休眠设备、用 SMB 补名称，或指定网段。
 - 安装包目前没有 Apple 公证。换一台 Mac 打开时，若系统拦截，到「系统设置 → 隐私与安全性」里允许。
-
-### Windows
-
-- x64 电脑用 `amd64` 安装包，ARM 电脑（如部分 Surface）用 `arm64` 安装包。
-- 安装程序装到当前用户的 `%LOCALAPPDATA%\Programs`，不需要管理员权限。开始菜单里可以打开，设置里可以卸载。
-- 安装包没有 Windows 代码签名。SmartScreen 提示时，选择仍要运行。
-- 扫描脚本按 macOS 编写，调用 `route`、`ifconfig`、`arp`、`dns-sd` 和 macOS 版 `ping`。Windows 上可以打开界面，目前不能扫描局域网。
-
-### Linux
-
-- 需要图形桌面。托盘在 Linux 上是菜单，桌面需要能显示 AppIndicator（Debian、Ubuntu 上是 `libayatana-appindicator3-1`）。
-- 用压缩包旁的 `install.sh` 安装时，应用在 `~/.local/mylan.app`，不需要 root。`.deb` 安装到 `/opt`，之后用系统的包管理器更新。
-- 需要已安装的 `python3`。
-- 扫描脚本按 macOS 编写。Linux 上可以打开界面，目前不能扫描局域网。
 
 ## 开发
 
@@ -61,19 +45,17 @@ go tool mygo dev
 go tool mygo build
 ```
 
-一次打出上表里的各个系统：
+一次打出 Apple 芯片和 Intel 两份：
 
 ```sh
-go tool mygo build -platform darwin/arm64,darwin/amd64,windows/amd64,windows/arm64,linux/amd64,linux/arm64
+go tool mygo build -platform darwin/arm64,darwin/amd64
 ```
-
-在 Mac 上打 Windows 安装包需要 [NSIS](https://nsis.sourceforge.io)（`brew install makensis`）。没有它时，Windows 目录里只有程序，没有安装包。磁盘映像只在 macOS 上生成。
 
 给更新签名时带上私钥：
 
 ```sh
 export MYGO_UPDATER_PRIVATE_KEY="$(cat "$HOME/Library/Application Support/mygo/update-keys/mygo-update.key")"
-go tool mygo build -platform darwin/arm64,darwin/amd64,windows/amd64,windows/arm64,linux/amd64,linux/arm64
+go tool mygo build -platform darwin/arm64,darwin/amd64
 ```
 
 私钥只留在本机，以及仓库的 `MYGO_UPDATER_PRIVATE_KEY` secret。不要放进仓库。
@@ -97,10 +79,8 @@ The release page has these packages:
 | --- | --- |
 | macOS (Apple silicon) | `mylan 0.1.0 arm64.dmg` |
 | macOS (Intel) | `mylan 0.1.0 amd64.dmg` |
-| Windows x64 | `mylan Setup 0.1.0 amd64.exe` |
-| Windows ARM | `mylan Setup 0.1.0 arm64.exe` |
-| Linux x64 | `mylan-0.1.0-linux-amd64.tar.gz`, `mylan_0.1.0_amd64.deb` |
-| Linux ARM | `mylan-0.1.0-linux-arm64.tar.gz`, `mylan_0.1.0_arm64.deb` |
+
+Scanning uses the macOS `dns-sd`, `arp`, and `ping`. Windows and Linux cannot discover devices yet, so those installers are not published.
 
 ### macOS
 
@@ -110,20 +90,6 @@ The release page has these packages:
 - Scanning uses the system `python3`, plus `ping`, `arp`, `dns-sd`, and `smbutil`.
 - A full scan pings the current subnet and takes a few seconds. Settings can switch to fast mode, include sleeping devices, fill in names over SMB, or set a subnet.
 - The package is not notarized by Apple. If another Mac blocks it, allow it in System Settings → Privacy & Security.
-
-### Windows
-
-- Use the `amd64` installer on x64 PCs, and the `arm64` installer on ARM PCs such as some Surface models.
-- The installer puts the app in `%LOCALAPPDATA%\Programs` for the current user. It does not need an administrator. Open it from the Start menu, and uninstall it from Settings.
-- The installer is not code-signed for Windows. If SmartScreen warns, choose to run it anyway.
-- The scanner is written for macOS and calls `route`, `ifconfig`, `arp`, `dns-sd`, and the macOS `ping`. The window opens on Windows. Scanning the LAN does not work there yet.
-
-### Linux
-
-- A desktop session is required. The tray is a menu, so the desktop needs an AppIndicator (`libayatana-appindicator3-1` on Debian and Ubuntu).
-- `install.sh`, next to the archive, installs into `~/.local/mylan.app` without root. The `.deb` installs into `/opt` and is updated by the package manager.
-- `python3` must already be installed.
-- The scanner is written for macOS. The window opens on Linux. Scanning the LAN does not work there yet.
 
 ## Develop
 
@@ -142,19 +108,17 @@ One package for the machine you are on:
 go tool mygo build
 ```
 
-Every package in the table:
+Both Mac packages:
 
 ```sh
-go tool mygo build -platform darwin/arm64,darwin/amd64,windows/amd64,windows/arm64,linux/amd64,linux/arm64
+go tool mygo build -platform darwin/arm64,darwin/amd64
 ```
-
-Building the Windows installers on a Mac needs [NSIS](https://nsis.sourceforge.io) (`brew install makensis`). Without it, the Windows directory has the program and no installer. Disk images are created only on macOS.
 
 Sign updates with the private key:
 
 ```sh
 export MYGO_UPDATER_PRIVATE_KEY="$(cat "$HOME/Library/Application Support/mygo/update-keys/mygo-update.key")"
-go tool mygo build -platform darwin/arm64,darwin/amd64,windows/amd64,windows/arm64,linux/amd64,linux/arm64
+go tool mygo build -platform darwin/arm64,darwin/amd64
 ```
 
 Keep that key on this machine and in the `MYGO_UPDATER_PRIVATE_KEY` repository secret. Do not commit it.

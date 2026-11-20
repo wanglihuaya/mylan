@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -92,6 +93,22 @@ func ensureScript(dir string) (string, error) {
 	return path, nil
 }
 
+// scanUnavailable reports that this system cannot run the macOS scanner.
+// Windows would otherwise show the Microsoft Store Python alias, and the
+// panel would add the macOS local-network instructions.
+func scanUnavailable(goos string) error {
+	switch goos {
+	case "darwin":
+		return nil
+	case "windows":
+		return fmt.Errorf("当前版本的扫描只支持 macOS，Windows 上还不能发现局域网设备")
+	case "linux":
+		return fmt.Errorf("当前版本的扫描只支持 macOS，Linux 上还不能发现局域网设备")
+	default:
+		return fmt.Errorf("当前版本的扫描只支持 macOS")
+	}
+}
+
 func pythonBin() string {
 	if p, err := exec.LookPath("python3"); err == nil {
 		return p
@@ -105,6 +122,9 @@ func runScan(dir string, cfg config) (report, error) {
 	script, err := ensureScript(dir)
 	if err != nil {
 		return report{}, fmt.Errorf("无法准备扫描脚本: %w", err)
+	}
+	if err := scanUnavailable(runtime.GOOS); err != nil {
+		return report{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

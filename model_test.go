@@ -149,6 +149,20 @@ func TestLiveFastScan(t *testing.T) {
 	t.Logf("%s %d devices, %d warnings", rep.Scanned.Subnet, len(rep.Devices), len(rep.Warnings))
 }
 
+func TestScanUnavailable(t *testing.T) {
+	if err := scanUnavailable("darwin"); err != nil {
+		t.Fatal(err)
+	}
+	err := scanUnavailable("windows")
+	if err == nil || !strings.Contains(err.Error(), "Windows") || strings.Contains(err.Error(), "本地网络") {
+		t.Fatal(err)
+	}
+	err = scanUnavailable("linux")
+	if err == nil || !strings.Contains(err.Error(), "Linux") {
+		t.Fatal(err)
+	}
+}
+
 func names(devs []device) []string {
 	out := make([]string, len(devs))
 	for i, d := range devs {
